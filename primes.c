@@ -301,14 +301,17 @@ static int enumerate_small_primes_odd(
         void *context)
 {
     int res = 0;
-    if (min <= 2 && (res = callback(context, 2)) != 0) return res;
-    for (uint32_t i = min / 2; ; ++i) {
-        uint32_t p = 2*i + 1;
-        if (p > max) break;        
+
+    /* Handle 2 first. */
+    if (max < 2 || (min <= 2 && (res = callback(context, 2)) != 0)) return res;
+
+    /* Handle odd integers. Here max >= 2 so (max - 1) won't underflow. */
+    for (uint32_t i = min / 2; i <= (max - 1)/2; ++i) {
         if (odd_bitmap[i >> 3] & (1 << (i & 7))) {
-            if ((res = callback(context, p)) != 0) return res;
+            if ((res = callback(context, 2*i + 1)) != 0) return res;
         }
     }
+
     return res;
 }
 
