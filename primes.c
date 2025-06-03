@@ -244,8 +244,12 @@ static int save_wheel_bitmap(
     int res = 0;
     uint64_t stored_max = htole64(max);
     size_t byte_size = WHEEL_BITMAP_SIZE(max);
-    if (fwrite(&stored_max, sizeof(stored_max), 1, fp) != 1 ||
-        fwrite(wheel, 1, byte_size, fp) != byte_size) res = -2;
+    if ( fwrite(&stored_max, sizeof(stored_max), 1, fp) != 1 ||
+         fwrite(wheel, 1, byte_size, fp) != byte_size ) {
+        /* Write failed. */
+        errno = EIO;
+        res = -2;
+    }
     if (fclose(fp) != 0 && res == 0) res = -3;
     if (res != 0 && remove(cache_filename) != 0) {
         perror("failed to remove incomplete file");
@@ -268,7 +272,7 @@ static uint8_t *load_wheel_bitmap(const char *filename, uint64_t max) {
        but not if it's smaller. (Technically we could use the smaller
        bitmap to generate a larger one, but the complexity isn't worth it.) */
     uint64_t stored_max = 0;
-    if (fread(&stored_max, sizeof(stored_max), 1, fp) != 1) goto fail;
+    if (fread(&stored_max, sizeof(stored_max), 1, fp) != 1) goto eof;
     if (le64toh(stored_max) < max) {
         fprintf(stderr, "note: not using cached prime wheel bitmap because it is too small\n");
         errno = ENOENT;  /* suppress scary warnings at the call site */
@@ -277,14 +281,17 @@ static uint8_t *load_wheel_bitmap(const char *filename, uint64_t max) {
 
     /* Data should be good! Read the prefix we need. */
     if ((data = malloc(size)) == NULL) goto fail;
-    if (fread(data, 1, size, fp) != size) goto fail;
-    (void) fclose(fp);  /* don't care about error */
-    return data;
+    if (fread(data, 1, size, fp) != size) goto eof;
+    goto done;
 
+eof:
+    errno = EIO;
 fail:
     free(data);
+    data = NULL;
+done:
     (void) fclose(fp);  /* don't care about error */
-    return NULL;
+    return data;
 }
 
 
