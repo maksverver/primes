@@ -4,10 +4,19 @@ Uses a segmented Sieve of Eratosthenes, where the first 2**32 primes are
 precalculated and stored on disk compressed to 120 MB using a prime wheel that
 stores the primarily of every 2×3×5×7 = 210 integers in 48 bits = 6 bytes.
 
+Compilation (example):
+
+% cc -std=c99 -O3 -march=native -Wall -g primes.c  -lm -o primes
+
+% ./primes -h
+
+will print help on how to run.
+
 
 TODO's:
 
-    - implement generation of primes over 2**32
+    - support printing interesting numbers (with a decimal index close to a
+      power of 10, or a value close to a power of 2)
 
     - make loading/storing cache data optional (but print a warning when asking
       for a large number of primes)
@@ -15,7 +24,16 @@ TODO's:
         - add argument to use cache readonly (i.e. load if it exists, but do not
           overwrite)?
 
-    - maybe: store wheel data in shared memory backed by shm_open()?
+    - maybe: option to check primes using trial division? this should be faster
+        than sieving when max - min or count is small.
+
+    - maybe: faster printing of consecutive integers
+
+    - maybe: option to output composites instead of primes?
+
+    - maybe:
+        - store wheel data in shared memory backed by shm_open()?
+        - mmap() prime wheel if possible?
 
     - maybe: add a magic id to the wheel data? this could be used to detect
       endianness too.
@@ -25,10 +43,7 @@ TODO's:
       hardcode checksums of ranges in the source code: checksum of first N primes
       is Y etc.)
 
-    - mmap() prime wheel if possible?
-
-    - don't generate when arguments are small?
-
+    - clean up/improve estimate_max_ub() logic?
 
 Not planned:
 
@@ -78,6 +93,7 @@ static const uint8_t wheel210_offset[48] = {
    179, 181, 187, 191, 193, 197, 199, 209
 };
 
+#ifndef NDEBUG
 // Inverse of wheel210_offset. wheel210_index[i] = -1 if i is divisible by
 // 2, 3, 5, or 7, otherwise it lists an index into wheel210_offset such that
 // wheel210_offset[wheel_index[i]] = i.
@@ -105,6 +121,7 @@ static const int8_t wheel210_index[210] = {
    -1, 43, -1, 44, -1, -1, -1, 45, -1, 46,   // 200
    -1, -1, -1, -1, -1, -1, -1, -1, -1, 47,   // 210
 };
+#endif
 
 // Same as wheel210_index, but only elements at odd indices (since all elements
 // at even indices are -1).
@@ -137,8 +154,8 @@ static const int8_t wheel210_index_half[105] = {
 // only 48/210 integers are stored (see the definition of wheel-210 above).
 #define WHEEL_BITMAP_SIZE(max) (((max) / 210 + 1)*6)
 
-
-static void verify_wheel210_tables() {
+#ifndef NDEBUG
+static void static_assertions() {
     for (int i = 0; i < 48; ++i) {
         assert(wheel210_index[(int) wheel210_offset[i]] == i);
     }
@@ -149,6 +166,15 @@ static void verify_wheel210_tables() {
     for (int i = 0; i < 105; ++i) {
         assert(wheel210_index[2*i + 0] == -1);
         assert(wheel210_index[2*i + 1] == wheel210_index_half[i]);
+    }
+}
+#endif
+
+/* Clears bit as indices `start`, `start + step`, `start + 2*step`, etc. until
+   `start + i*step >= len`. */
+static void clear_bits(uint8_t *bitmap, uint64_t start, uint64_t step, uint64_t len) {
+    for (uint64_t i = start; i < len; i += step) {
+        bitmap[i >> 3] &= ~(1 << (i & 7));
     }
 }
 
@@ -171,17 +197,12 @@ static uint8_t *sieve_up_to_max(uint64_t max) {
     memset(bitmap, 0xff, bitmap_size);
     bitmap[0] = 0xfe; /* 1 is not prime */
 
-    /* adjust max so it ends at the bitmap */
-    max = (uint64_t) bitmap_size * 16 - 1;
-    assert(max >= 15 && (max & 15) == 15);
-
+    uint64_t len = (uint64_t) bitmap_size * 8;  /* bitmap size in bits */
     for (uint64_t i = 1; ; ++i) {
         if (bitmap[i >> 3] & (1 << (i & 7))) {
             uint64_t j = 2*i*i + 2*i;
-            if (j > max/2) return bitmap;
-            for (; j <= max/2; j += 2*i + 1) {
-                bitmap[j >> 3] &= ~(1 << (j & 7));
-            }
+            if (j > len) return bitmap;
+            clear_bits(bitmap, j, 2*i + 1, len);
         }
     }
 }
@@ -290,7 +311,7 @@ fail:
     free(data);
     data = NULL;
 done:
-    (void) fclose(fp);  /* don't care about error */
+    (void) fclose(fp);  /* don't care about failure */
     return data;
 }
 
@@ -322,7 +343,7 @@ static int enumerate_small_primes_odd(
     return res;
 }
 
-static int enumerate_small_primes_sieve_only(
+static int enumerate_small_primes_sieved(
         uint32_t min,
         uint32_t max,
         enumerate_prime_callback_t callback,
@@ -386,25 +407,119 @@ static int enumerate_small_primes_wheel(
     return 0;
 }
 
-int enumerate_primes(
+struct sieve_segment_context {
+    uint8_t *bitmap;
+    uint64_t len, min, max;
+};
+
+/* Removes the multiples of `p` from the bitmap of length `len` (in bits) that
+represents the odd integers starting from `min`.
+
+Assumes min <= max, p <= UINT32_MAX, and `min`, `max` and `p` are all odd. */
+int sieve_segment(void *ctx_arg, uint64_t p) {
+    struct sieve_segment_context *ctx = ctx_arg;
+    uint64_t start = p * p;
+    if (start > ctx->max) return 1;
+    if (start < ctx->min) {
+        /* Round `start` up to the first multiple of p at least `min`,
+           but be careful to avoid 64-bit overflow: */
+        start = (ctx->min - 1) / p * p;
+        if (start % 2 == 0) {
+            if (ctx->max - start < p) return 0; /* skip this one */
+            start += p;
+        } else {
+            if (ctx->max - start < 2*p) return 0; /* skip this one */
+            start += 2*p;
+        }
+    }
+    assert(ctx->min % 2 == 1);
+    assert(start % 2 == 1);
+    assert(start >= ctx->min);
+    assert(start <= ctx->max);
+    clear_bits(ctx->bitmap, (start - ctx->min)/2, p, ctx->len);
+    return 0;
+}
+
+/* Enumerates primes in the range from min to max (inclusive).
+
+`wheel` must be a pointer to the wheel bitmap of all primes below UINT32_MAX
+(2**32). For each prime found, callback(context) is called. If the callback
+returns 0, enumeration continues.
+
+If `supports_flush` is true, then this function will invoke callback with
+argument 0 whenever a large batch of output is complete. This allows e.g.
+flushing output buffered so far. Note that this is purely informational;
+there is no guarantee this will be called at all!
+
+This function returns the nonzero value returned by callback(), or 0 if the
+callback always returned 0 (or was never called at all).
+
+This function may allocate up to 256 MiB for additional sieving. If allocation
+fails, this function returns -1 and errno is set to ENOMEM.
+*/
+int enumerate_primes_sieved(
         const uint8_t *wheel,
         uint64_t min, uint64_t max,
-        enumerate_prime_callback_t callback, void *context)
+        enumerate_prime_callback_t callback, void *context,
+        bool supports_flush)
 {
-    if (min > max) return 0;
+    /* Normalize min and max so they are both odd and min <= max.
+       This handles some edge cases and is required by sieve_segment below. */
+    if (min % 2 == 0) ++min;
+    if (max % 2 == 0 && max > 0) --max;
+    if (min > max) return 0;  /* empty range */
 
     if (max <= UINT32_MAX) {
+        /* Range is small. Enumerate from wheel bitmap and return. */
         return enumerate_small_primes_wheel(wheel, min, max, callback, context);
     }
-    
+
+    /* Allocate memory in advance, so we fail early if there isn't enough memory
+       to finish the operation. */
+    uint8_t *bitmap = malloc(MIN(max - min, UINT32_MAX) / 16 + 1);
+    if (bitmap == NULL) return -1;
+
+    /* Handle the primes up to UINT32_MAX separately: */
+    int res = 0;
     if (min <= UINT32_MAX) {
-        int res = enumerate_small_primes_wheel(wheel, min, UINT32_MAX, callback, context);
-        if (res != 0) return res;
-        min = UINT32_MAX + 1;
+        res = enumerate_small_primes_wheel(wheel, min, UINT32_MAX, callback, context);
+        if (res != 0) goto finish;
+        min = (uint64_t) UINT32_MAX + 2;  /* +2 to keep min odd! */
     }
-    
-    // TODO: larger numbers!
-    return 0;
+
+    /* Now min >= 2**32 and we will sieve the remaining numbers one segment of
+       up to 2**32 integers at a time. Since there are 203,280,221 primes below
+       UINT32_MAX, this can get relatively slow for later ranges. */
+    for (;;) {
+        if (supports_flush && (res = callback(context, 0)) != 0) goto finish;
+
+        assert(min % 2 == 1 && max % 2 == 1);
+
+        uint64_t diff = MIN(max - min, UINT32_MAX);
+        memset(bitmap, 0xff, diff/16 + 1);
+
+        struct sieve_segment_context ssc = {
+            .bitmap = bitmap,
+            .len = diff/2 + 1,
+            .min = min,
+            .max = min + diff,
+        };
+        enumerate_small_primes_wheel(wheel, 3, UINT32_MAX, sieve_segment, &ssc);
+
+        for (uint64_t i = 0; i <= diff/2; ++i) {
+            if (bitmap[i >> 3] & (1 << (i & 7))) {
+                uint64_t p = min + 2*i;  /* note: `min` is odd here */
+                res = callback(context, p);
+            }
+        }
+
+        if (min + diff >= max) break;  /* avoid overflow */
+        min += diff + 1;
+    }
+
+finish:
+    free(bitmap);
+    return res;
 }
 
 struct print_context {
@@ -415,7 +530,12 @@ struct print_context {
 };
 
 static int print_callback(void *ctx_arg, uint64_t prime) {
-    struct print_context *ctx = (struct print_context *)ctx_arg;
+    if (prime == 0) {
+        fflush(stdout);
+        return 0;
+    }
+
+    struct print_context *ctx = ctx_arg;
     if (prime > ctx->max_prime) return 1;
     if (ctx->count >= ctx->max_count) return 2;
     if (ctx->fp != NULL) fprintf(ctx->fp, "%" PRIu64 "\n", prime);
@@ -584,7 +704,11 @@ uint64_t estimate_max_ub(uint64_t min, uint64_t max, uint64_t count) {
 
     // upper bound on the number of primes below `min`.
     uint64_t skipped = min/2;
-    if (min > 10) skipped = ceil(min / log(min) * 1.25506);
+    if (min >= 4000) {
+        skipped = ceil(min / (log(min) - 1.1));
+    } else if (min >= 10) {
+        skipped = ceil(min / log(min) * 1.25506);
+    }
     if (skipped >= UINT64_MAX - count) return max;  /* prevent overflow */
 
     // i = index of the largest prime we will generate.
@@ -603,8 +727,9 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    verify_wheel210_tables();
-
+#ifndef NDEBUG
+    static_assertions();
+#endif
     if (arg_max_prime < arg_min_prime) return 0;
    
     struct print_context print_context = {
@@ -617,7 +742,7 @@ int main(int argc, char *argv[]) {
     uint64_t max_ub = estimate_max_ub(arg_min_prime, arg_max_prime, arg_max_count);
     if (max_ub < 2000000) {
         /* Only primes below 2 million. Sieving in memory is fast enough. */
-        enumerate_small_primes_sieve_only(
+        enumerate_small_primes_sieved(
             arg_min_prime, max_ub, print_callback, &print_context);
     } else {
         /* Use wheel bitmap if we can. Don't generate larger than 32-bit integers.
@@ -629,7 +754,9 @@ int main(int argc, char *argv[]) {
             perror("failed to generate wheel bitmap");
             exit(1);
         } else {
-            enumerate_primes(wheel, arg_min_prime, arg_max_prime, print_callback, &print_context);
+            enumerate_primes_sieved(
+                    wheel, arg_min_prime, max_ub,
+                    print_callback, &print_context, true);
             free((void*) wheel);
         }
     }
