@@ -27,8 +27,6 @@ TODO's:
     - maybe: option to check primes using trial division? this should be faster
         than sieving when max - min or count is small.
 
-    - maybe: faster printing of consecutive integers
-
     - maybe: option to output composites instead of primes?
 
     - maybe:
@@ -527,7 +525,32 @@ struct print_context {
     uint64_t count;
     uint64_t max_prime;
     uint64_t max_count;
+
+    /* Used to optimize printing of consecutive integers.
+
+       When buf_len > 0, buf stores a string of length len of the form
+       "<buf_val>\n" followed by a terminating NUL character. Note that 64-bit
+       numbers have most 20 digits, so we need at most 22 bytes. */
+    uint64_t buf_val;
+    size_t buf_len;
+    char buf[24];
 };
+
+static void update_print_buf(struct print_context *ctx, uint64_t new_val) {
+    size_t old_val = ctx->buf_val;
+    ctx->buf_val = new_val;
+    if (new_val >= old_val && ctx->buf_len >= 2) {
+        uint64_t add = new_val - old_val;
+        for (size_t i = ctx->buf_len - 1; i--; ) {
+            add += ctx->buf[i] - '0';
+            ctx->buf[i] = add%10 + '0';
+            add /= 10;
+            if (add == 0) return;  /* updated */
+        }
+        /* if we get here, we didn't have enough space */
+    }
+    ctx->buf_len = snprintf(ctx->buf, sizeof(ctx->buf), "%" PRIu64 "\n", new_val);
+}
 
 static int print_callback(void *ctx_arg, uint64_t prime) {
     if (prime == 0) {
@@ -538,7 +561,10 @@ static int print_callback(void *ctx_arg, uint64_t prime) {
     struct print_context *ctx = ctx_arg;
     if (prime > ctx->max_prime) return 1;
     if (ctx->count >= ctx->max_count) return 2;
-    if (ctx->fp != NULL) fprintf(ctx->fp, "%" PRIu64 "\n", prime);
+    if (ctx->fp != NULL) {
+        update_print_buf(ctx, prime);
+        fwrite(ctx->buf, 1, ctx->buf_len, ctx->fp);
+    }
     ++ctx->count;
     return 0;
 }
