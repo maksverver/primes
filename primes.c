@@ -15,9 +15,6 @@ will print help on how to run.
 
 TODO's:
 
-    - support printing interesting numbers (with a decimal index close to a
-      power of 10, or a value close to a power of 2)
-
     - make loading/storing cache data optional (but print a warning when asking
       for a large number of primes)
         - add argument to specify cache file location?
@@ -42,6 +39,9 @@ TODO's:
       is Y etc.)
 
     - clean up/improve estimate_max_ub() logic?
+
+    - support printing of interesting number with a minimum
+      (removes the ability to mark primes interesting based on index)
 
 Not planned:
 
@@ -520,20 +520,41 @@ finish:
     return res;
 }
 
+enum interest {
+    INT_NONE = 0,
+    INT_IDX  = 1,
+    INT_DEC  = 2,
+    INT_HEX  = 4,
+};
+
 struct print_context {
     FILE *fp;
     uint64_t count;
     uint64_t max_prime;
     uint64_t max_count;
 
-    /* Used to optimize printing of consecutive integers.
+    union {
+        /* Used to optimize printing of consecutive integers.
 
-       When buf_len > 0, buf stores a string of length len of the form
-       "<buf_val>\n" followed by a terminating NUL character. Note that 64-bit
-       numbers have most 20 digits, so we need at most 22 bytes. */
-    uint64_t buf_val;
-    size_t buf_len;
-    char buf[24];
+        When buf_len > 0, buf stores a string of length len of the form
+        "<buf_val>\n" followed by a terminating NUL character. Note that 64-bit
+        numbers have most 20 digits, so we need at most 22 bytes. */
+        struct {
+            uint64_t buf_val;
+            size_t buf_len;
+            char buf[24];
+        };
+
+        /* for printing interesting numbers */
+        struct {
+            uint64_t prev_prime;
+            enum interest prev_interest;
+            uint64_t last_printed_index;
+            uint64_t next_power_of_2;
+            uint64_t next_power_of_10;
+            uint64_t next_index_power_of_10;
+        };
+    };
 };
 
 static void update_print_buf(struct print_context *ctx, uint64_t new_val) {
@@ -553,12 +574,11 @@ static void update_print_buf(struct print_context *ctx, uint64_t new_val) {
 }
 
 static int print_callback(void *ctx_arg, uint64_t prime) {
+    struct print_context *ctx = ctx_arg;
     if (prime == 0) {
-        fflush(stdout);
+        if (ctx->fp != NULL) fflush(ctx->fp);
         return 0;
     }
-
-    struct print_context *ctx = ctx_arg;
     if (prime > ctx->max_prime) return 1;
     if (ctx->count >= ctx->max_count) return 2;
     if (ctx->fp != NULL) {
@@ -569,10 +589,65 @@ static int print_callback(void *ctx_arg, uint64_t prime) {
     return 0;
 }
 
+static void print_interesting(struct print_context *ctx) {
+    if (ctx->prev_prime > 0 && ctx->prev_interest != INT_NONE && ctx->fp != NULL) {
+        if (ctx->count > ctx->last_printed_index + 1) fputs("\n", ctx->fp);
+        fprintf(ctx->fp, "%20" PRIu64 ".%c %20" PRIu64 " (dec)%c %20" PRIx64 " (hex)%c\n",
+                ctx->count,      (ctx->prev_interest & INT_IDX) ? '*' : ' ',
+                ctx->prev_prime, (ctx->prev_interest & INT_DEC) ? '*' : ' ',
+                ctx->prev_prime, (ctx->prev_interest & INT_HEX) ? '*' : ' ');
+        fflush(ctx->fp);
+        ctx->last_printed_index = ctx->count;
+    }
+    ctx->prev_interest = INT_NONE;
+}
+
+/* Prints only the primes that are slightly interesting, where interesting is defined as one
+of the following:
+
+  1. The index of the prime is within 3 of a power of 10 (e.g. index 97, 98, 99, 100, 101, 102).
+  2. The prime is the highest below or the lowest above a power of 10 (e.g. 9973, 10007).
+  3. The prime is the highest below or the lowest above a power of 2 (e.g. 0xfff1, 0x10001).
+
+This function labels the interesting column with an asterisk. */
+static int print_interesting_callback(void *ctx_arg, uint64_t prime) {
+    struct print_context *ctx = ctx_arg;
+    if (prime == 0) {
+        if (ctx->fp != NULL) fflush(ctx->fp);
+        return 0;
+    }
+    if (prime > ctx->max_prime || ctx->count >= ctx->max_count) return 1;
+
+    enum interest next_interest = INT_NONE;
+    if (ctx->next_index_power_of_10 + 2 - ctx->count <= 6) {
+        next_interest = INT_IDX;
+        if (ctx->next_index_power_of_10 + 2 == ctx->count) {
+            ctx->next_index_power_of_10 = ctx->next_index_power_of_10 == 0 ? 10 :
+                10*ctx->next_index_power_of_10;
+        }
+    }
+    if (prime > ctx->next_power_of_2) {
+        ctx->prev_interest |= INT_HEX;
+        next_interest |= INT_HEX;
+        ctx->next_power_of_2 = ctx->next_power_of_2 == 0 ? 2 : ctx->next_power_of_2 * 2;
+    }
+    if (prime > ctx->next_power_of_10) {
+        ctx->prev_interest |= INT_DEC;
+        next_interest |= INT_DEC;
+        ctx->next_power_of_10 = ctx->next_power_of_10 == 0 ? 10 : ctx->next_power_of_10 * 10;
+    }
+    print_interesting(ctx);
+    ctx->prev_interest = next_interest;
+    ctx->prev_prime    = prime;
+    ctx->count++;
+    return 0;
+}
+
 static uint64_t arg_min_prime = 0;
 static uint64_t arg_max_prime = UINT64_MAX;
 static uint64_t arg_max_count = UINT64_MAX;
-static bool arg_count_only = 0;
+static bool arg_count_only = false;
+static bool arg_interesting_only = false;
 
 bool parse_uint64(const char *arg, uint64_t *val) {
     /* strtoull() incorrectly converts negative numbers to unsigned */
@@ -594,6 +669,7 @@ static const char *usage =
 "Options:\n"
 "  -c                   count only (don't print)\n"
 "  -n <n>               print up to n primes\n"
+"  -I                   print interesting primes only\n"
 ;
 
 bool parse_args(int argc, char *argv[]) {
@@ -610,6 +686,12 @@ bool parse_args(int argc, char *argv[]) {
                 return false;
             }
             arg_count_only = true;
+        } else if (strcmp(arg, "-I") == 0) {
+            if (arg_interesting_only) {
+                fprintf(stderr, "Duplicate option -I\n");
+                return false;
+            }
+            arg_interesting_only = true;
         } else if (strncmp(arg, "-n", 2) == 0) {
             if (have_n) {
                 fprintf(stderr, "Duplicate option -n\n");
@@ -645,6 +727,17 @@ bool parse_args(int argc, char *argv[]) {
             return false;
         }
     }
+    if (arg_interesting_only) {
+        if (arg_count_only) {
+            fprintf(stderr, "Cannot specify both -I and -c\n");
+            return false;
+        }
+        if (arg_min_prime > 2) {
+            fprintf(stderr, "Cannot raise the minimum when specifying -I\n");
+            return false;
+        }
+    }
+
     if (arg_min_prime > arg_max_prime) {
         fprintf(stderr, "Warning: min > max (no primes will match)\n");
     }
@@ -758,18 +851,19 @@ int main(int argc, char *argv[]) {
 #endif
     if (arg_max_prime < arg_min_prime) return 0;
    
-    struct print_context print_context = {
+    struct print_context context = {
         .fp         = arg_count_only ? NULL : stdout,
         .count      = 0,
         .max_prime  = arg_max_prime,
         .max_count  = arg_max_count,
     };
+    enumerate_prime_callback_t callback = print_callback;
+    if (arg_interesting_only) callback = print_interesting_callback;
 
     uint64_t max_ub = estimate_max_ub(arg_min_prime, arg_max_prime, arg_max_count);
     if (max_ub < 2000000) {
         /* Only primes below 2 million. Sieving in memory is fast enough. */
-        enumerate_small_primes_sieved(
-            arg_min_prime, max_ub, print_callback, &print_context);
+        enumerate_small_primes_sieved(arg_min_prime, max_ub, callback, &context);
     } else {
         /* Use wheel bitmap if we can. Don't generate larger than 32-bit integers.
            Round up to 2^k - 1 to avoid repeated overwrites with tiny increases. */
@@ -782,13 +876,28 @@ int main(int argc, char *argv[]) {
         } else {
             enumerate_primes_sieved(
                     wheel, arg_min_prime, max_ub,
-                    print_callback, &print_context, true);
+                    callback, &context, true);
             free((void*) wheel);
         }
     }
 
+    if (arg_interesting_only) {
+        /* Print the final interesting number. This is necessary because
+           print_interesting_callback lags behind by one prime, so for example
+           `primes -I 1 20` would not print 19 without calling
+           print_interesting() here.
+
+           Note that it's still possible to miss the final line. For example, 13
+           is considered interesting because it's the last four-bit prime (1101
+           in binary), but that's only discovered when 17 is enumerated, so e.g.
+           `primes -I 1 15` won't show 13 as being interesting. I don't have a
+           good solution for this, but I don't think it matters much in practice.
+        */
+        print_interesting(&context);
+    }
+
     if (arg_count_only) {
-        printf("%" PRIu64 "\n", print_context.count);
+        printf("%" PRIu64 "\n", context.count);
     }
 
     return 0;
