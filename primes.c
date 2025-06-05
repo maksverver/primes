@@ -15,12 +15,6 @@ will print help on how to run.
 
 TODO's:
 
-    - make loading/storing cache data optional (but print a warning when asking
-      for a large number of primes)
-        - add argument to specify cache file location?
-        - add argument to use cache readonly (i.e. load if it exists, but do not
-          overwrite)?
-
     - maybe: option to check primes using trial division? this should be faster
         than sieving when max - min or count is small.
 
@@ -29,9 +23,6 @@ TODO's:
     - maybe:
         - store wheel data in shared memory backed by shm_open()?
         - mmap() prime wheel if possible?
-
-    - maybe: add a magic id to the wheel data? this could be used to detect
-      endianness too.
 
     - maybe: add a checksum to the wheel data to verify it is intact?
       this would be a bit tricky when loading partial data. (though I could
@@ -42,6 +33,9 @@ TODO's:
 
     - support printing of interesting number with a minimum
       (removes the ability to mark primes interesting based on index)
+
+    - maybe: add an option to use the cache readonly (load if it exists, but do
+      not overwrite).
 
 Not planned:
 
@@ -74,6 +68,8 @@ Not planned:
 #ifndef le64toh
 #define le64toh(x) (x)
 #endif
+
+const uint64_t wheel_magic_id = 3472612198888075856;  // "Prime210"
 
 // Prime wheel of factors {2, 3, 5, 7} with size 2×3×5×7 = 210.
 //
@@ -124,7 +120,7 @@ static const int8_t wheel210_index[210] = {
 // Same as wheel210_index, but only elements at odd indices (since all elements
 // at even indices are -1).
 static const int8_t wheel210_index_half[105] = {
-//  1   3   5   7   9   11  13  15  17  19   
+//  1   3   5   7   9   11  13  15  17  19
     0, -1, -1, -1, -1,   1,  2, -1,  3,  4,   //  20
    -1,  5, -1, -1,  6,   7, -1, -1,  8, -1,   //  40
     9, 10, -1, 11, -1,  -1, 12, -1, -1, 13,   //  60
@@ -261,9 +257,11 @@ static int save_wheel_bitmap(
     FILE *fp = fopen(cache_filename, "wb");
     if (fp == NULL) return -1;
     int res = 0;
-    uint64_t stored_max = htole64(max);
+    uint64_t stored_max   = htole64(max);
+    uint64_t stored_magic = htole64(wheel_magic_id);
     size_t byte_size = WHEEL_BITMAP_SIZE(max);
-    if ( fwrite(&stored_max, sizeof(stored_max), 1, fp) != 1 ||
+    if ( fwrite(&stored_magic, sizeof(stored_magic), 1, fp) != 1 ||
+         fwrite(&stored_max,   sizeof(stored_max),   1, fp) != 1 ||
          fwrite(wheel, 1, byte_size, fp) != byte_size ) {
         /* Write failed. */
         errno = EIO;
@@ -290,7 +288,15 @@ static uint8_t *load_wheel_bitmap(const char *filename, uint64_t max) {
     /* Check the stored maximum. We can use the existing data if it's larger,
        but not if it's smaller. (Technically we could use the smaller
        bitmap to generate a larger one, but the complexity isn't worth it.) */
+    uint64_t stored_magic = 0;
     uint64_t stored_max = 0;
+    if (fread(&stored_magic, sizeof(stored_magic), 1, fp) != 1) goto eof;
+    if (le64toh(stored_magic) != wheel_magic_id) {
+        errno = EINVAL;
+        fprintf(stderr, "cached prime wheel bitmap has invalid signature\n");
+        goto fail;
+    }
+
     if (fread(&stored_max, sizeof(stored_max), 1, fp) != 1) goto eof;
     if (le64toh(stored_max) < max) {
         fprintf(stderr, "note: not using cached prime wheel bitmap because it is too small\n");
@@ -648,6 +654,7 @@ static uint64_t arg_max_prime = UINT64_MAX;
 static uint64_t arg_max_count = UINT64_MAX;
 static bool arg_count_only = false;
 static bool arg_interesting_only = false;
+static const char *cache_filename = NULL;
 
 bool parse_uint64(const char *arg, uint64_t *val) {
     /* strtoull() incorrectly converts negative numbers to unsigned */
@@ -659,7 +666,7 @@ bool parse_uint64(const char *arg, uint64_t *val) {
     return errno == 0 && *end == '\0' && *val <= UINT64_MAX;
 }
 
-static const char *usage = 
+static const char *usage =
 "Usage:\n"
 "  primes               prints all primes below 2^64\n"
 "  primes -h            prints this help, then exits\n"
@@ -668,8 +675,12 @@ static const char *usage =
 "\n"
 "Options:\n"
 "  -c                   count only (don't print)\n"
-"  -n <n>               print up to n primes\n"
+"  -C <filename>        set cache filename (overrides environment)\n"
 "  -I                   print interesting primes only\n"
+"  -n <n>               generate up to n primes\n"
+"\n"
+"Environmental variables:\n"
+"  PRIMES_CACHE         cache filename (e.g. /tmp/primes.bin)\n"
 ;
 
 bool parse_args(int argc, char *argv[]) {
@@ -680,6 +691,19 @@ bool parse_args(int argc, char *argv[]) {
         if (strcmp(arg, "-h") == 0) {
             fputs(usage, stdout);
             exit(0);
+        } else if (strncmp(arg, "-C", 2) == 0) {
+            if (cache_filename != NULL) {
+                fprintf(stderr, "Duplicate option -C\n");
+                return false;
+            }
+            if (arg[2] != '\0') {
+                cache_filename = arg + 2;  /* -n123 */
+            } else if (i < argc) {
+                cache_filename = argv[i++];  /* -n 123 */
+            } else {
+                fprintf(stderr, "Missing argument for option -C\n");
+                return false;
+            }
         } else if (strcmp(arg, "-c") == 0) {
             if (arg_count_only) {
                 fprintf(stderr, "Duplicate option -c\n");
@@ -714,7 +738,7 @@ bool parse_args(int argc, char *argv[]) {
             if (!parse_uint64(arg, &arg_min_prime)) {
                 fprintf(stderr, "Invalid min argument: %s\n", arg);
                 return false;
-            }            
+            }
             ++have_args;
         } else if (have_args == 1) {
             if (!parse_uint64(arg, &arg_max_prime)) {
@@ -747,14 +771,6 @@ bool parse_args(int argc, char *argv[]) {
     return true;
 }
 
-/* Name of the cache file that stores generate wheel bitmaps.
-
-These may be generated for a maximum of up to 2**32, in which case the file
-takes about 120 MiB of disk space. (Note that 2**32 is not an intrinsic limit
-of wheel bitmaps, it's just that bitmaps larger than 2**32 aren't useful for
-segmented sieving when the maximum possible prime must fit in 2**64.) */
-static const char *default_cache_filename = "primes32-wheel210.bin";
-
 /* Generates the prime number wheel bitmap for primes up to `max`.
 
 If cache_filename is NULL, this will just call generate_small_prime_wheel(max).
@@ -772,6 +788,12 @@ static uint8_t *generate_cached_prime_wheel(
         const char *cache_filename,
         uint64_t max
 ) {
+    if (cache_filename == NULL && max > 10000) {
+        fprintf(stderr,
+                "WARNING: generating large numbers of primes without cache is slow!\n"
+                "Consider setting PRIMES_CACHE or use the -C argument to specify a cache\n"
+                "location to speed up future invocations.\n");
+    }
     uint8_t *wheel = NULL;
     if (cache_filename != NULL) {
         /* Try to load existing version from disk */
@@ -846,11 +868,17 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
+    if (cache_filename == NULL) {
+        /* Cache filename was not specified on the command line.
+           Try getting it from the environment instead. */
+        cache_filename = getenv("PRIMES_CACHE");
+    }
+
 #ifndef NDEBUG
     static_assertions();
 #endif
     if (arg_max_prime < arg_min_prime) return 0;
-   
+
     struct print_context context = {
         .fp         = arg_count_only ? NULL : stdout,
         .count      = 0,
@@ -869,7 +897,7 @@ int main(int argc, char *argv[]) {
            Round up to 2^k - 1 to avoid repeated overwrites with tiny increases. */
         uint32_t wheel_max = UINT32_MAX;
         while ((wheel_max >> 1) >= max_ub) wheel_max >>= 1;
-        const uint8_t *wheel = generate_cached_prime_wheel(default_cache_filename, wheel_max);
+        const uint8_t *wheel = generate_cached_prime_wheel(cache_filename, wheel_max);
         if (wheel == NULL) {
             perror("failed to generate wheel bitmap");
             exit(1);
