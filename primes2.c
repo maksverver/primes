@@ -27,7 +27,7 @@ this version keeps track of the next multiple of each prime (offset within the
 page only, to save space).
 
 Also unlike primes.c this program does not cache the primes below 2**32 on disk,
-so generating the initial small primes list may take a while (around 30 seconds).
+so generating the initial small primes list may take a while (around 20 seconds).
 
 The code here also includes some of the other tricks I came up with while
 implementing primes.c, such as the optimization of printing consecutive decimal
@@ -44,8 +44,10 @@ numbers. */
 #define PRIME_COUNT_UNDER_20 8
 static const uint32_t primes_under_20[PRIME_COUNT_UNDER_20] = { 2, 3, 5, 7, 11, 13, 17, 19 };
 
-#define PRIME_COUNT_32_BITS 203280221
-#define PRIME_COUNT_SMALL (PRIME_COUNT_32_BITS - PRIME_COUNT_UNDER_20)
+#define PRIME_COUNT_16_BITS      6542  /* number of 16-bit primes:       6,542 */
+#define PRIME_COUNT_32_BITS 203280221  /* number of 32-bit primes: 203,280,221 */
+#define PRIME_COUNT_TINY    (PRIME_COUNT_16_BITS - PRIME_COUNT_UNDER_20)
+#define PRIME_COUNT_SMALL   (PRIME_COUNT_32_BITS - PRIME_COUNT_UNDER_20)
 static uint32_t small_primes[PRIME_COUNT_SMALL];  /* ~775 MiB */
 static uint32_t next_multiple[PRIME_COUNT_SMALL]; /* ~775 MiB */
 
@@ -109,6 +111,10 @@ static void output_prime(uint64_t p) {
 
 /* Next follows the code to calculate primes. */
 
+static uint64_t square(uint32_t p) {
+    return (uint64_t)p * p;
+}
+
 /* Initializes odd_bitmap with a periodic pattern with multiples of the primes
 under 20 already marked off, which speeds up the first few iterations of the
 sieve, which are the slowest. */
@@ -137,33 +143,51 @@ static void initialize_odd_bitmap(uint64_t start) {
 /* Generates and outputs all primes between 20 and UINT32_MAX, populating the
    small_primes[] and next_multiple[] tables along the way. */
 static void generate_small_primes() {
-    fprintf(stderr, "Calculating %d primes up to %u.\n", PRIME_COUNT_32_BITS, UINT32_MAX);
     initialize_odd_bitmap(0);
     size_t k = 0;
-    for (size_t i = 1; i <= UINT32_MAX/2; ++i) {
+    for (size_t i = 1; i <= UINT16_MAX/2; ++i) {
         if (odd_bitmap[i >> 3] & (1 << (i & 7))) {
             size_t j = 2*i*i + 2*i;
-            while (j <= UINT32_MAX/2) {
+            while (j <= UINT16_MAX/2) {
                 odd_bitmap[j >> 3] &= ~(1 << (j & 7));
                 j += 2*i + 1;
             }
             small_primes[k] = 2*i + 1;
-            next_multiple[k] = j & (UINT32_MAX/2);  /* note odd index */
+            next_multiple[k] = j;  /* note odd index */
             ++k;
             output_prime(2*i + 1);
-            if ((k & (k - 1)) == 0) flush();  /* flush output early at the start */
         }
+    }
+    flush();
+    size_t n = k;  /* number of primes between 20 and 2**16 */
+    assert(n == PRIME_COUNT_TINY);
+    for (uint32_t page = 1; page <= UINT16_MAX; ++page) {
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t m = next_multiple[i];
+            uint32_t p = small_primes[i];
+            while (m <= (page << 15) + UINT16_MAX/2) {
+                odd_bitmap[(page << 12) | (m >> 3)] &= ~(1 << (m & 7));
+                m += p;
+            }
+            next_multiple[i] = m;
+        }
+        /* Output primes found on this page. */
+        for (size_t i = (page << 15); i <= (page << 15) + UINT16_MAX/2; ++i) {
+            if (odd_bitmap[i >> 3] & (1 << (i & 7))) {
+                small_primes[k] = 2*i + 1;
+                next_multiple[k] = 2*i*i + 2*i;  /* note odd index; possible overflow */
+                ++k;
+                output_prime(2*i + 1);
+            }
+        }
+        flush();
     }
     if (k != PRIME_COUNT_SMALL) {  /* sanity check */
         fprintf(stderr, "Incorrect number of small primes!\n"
             "Expected: %zu\nFound: %zu\n", k, (size_t)PRIME_COUNT_SMALL);
         exit(1);
     }
-    flush();
-}
-
-static uint64_t square(uint32_t p) {
-    return (uint64_t)p * p;
+    for (size_t i = 0; i < k; ++i) next_multiple[i] &= UINT32_MAX/2;
 }
 
 int main() {
