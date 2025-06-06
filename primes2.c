@@ -3,7 +3,7 @@
 Unlike primes.c, this program doesn't have any configurable options. It only
 prints all the prime numbers, in decimal notation, one per line, in order, and
 the code is optimized for being fast and concise. It's around 33% faster than
-primes.c, though it does use about 4x as much memory (2.5 GiB vs 630 MiB).
+primes.c, though it does use around 3x as much memory (1.8 GiB vs 630 MiB).
 
 Since this prints a lot of output, it's probably useful to filter it somehow,
 for example:
@@ -23,8 +23,8 @@ pages. It's not necessary to keep track of larger primes, because any number
 below 2**64 that's not a prime has a divisor below 2**32.
 
 An optimization of the segmented sieve algorithm (compared to primes.c) is that
-this version keeps track of the last multiple of each prime used, which means
-there is much less overhead per prime.
+this version keeps track of the next multiple of each prime (offset within the
+page only, to save space).
 
 Also unlike primes.c this program does not cache the primes below 2**32 on disk,
 so generating the initial small primes list may take a while (around 30 seconds).
@@ -47,7 +47,7 @@ static const uint32_t primes_under_20[PRIME_COUNT_UNDER_20] = { 2, 3, 5, 7, 11, 
 #define PRIME_COUNT_32_BITS 203280221
 #define PRIME_COUNT_SMALL (PRIME_COUNT_32_BITS - PRIME_COUNT_UNDER_20)
 static uint32_t small_primes[PRIME_COUNT_SMALL];  /* ~775 MiB */
-static uint64_t next_multiple[PRIME_COUNT_SMALL]; /* ~1.55 GiB */
+static uint32_t next_multiple[PRIME_COUNT_SMALL]; /* ~775 MiB */
 
 static uint8_t init_pattern[3*5*7*11*13*17*19];   /* ~4.6 MiB */
 static uint8_t odd_bitmap[UINT32_MAX / 16 + 1];   /*  256 MiB */
@@ -148,7 +148,7 @@ static void generate_small_primes() {
                 j += 2*i + 1;
             }
             small_primes[k] = 2*i + 1;
-            next_multiple[k] = j;  /* note odd index */
+            next_multiple[k] = j & (UINT32_MAX/2);  /* note odd index */
             ++k;
             output_prime(2*i + 1);
             if ((k & (k - 1)) == 0) flush();  /* flush output early at the start */
@@ -160,6 +160,10 @@ static void generate_small_primes() {
         exit(1);
     }
     flush();
+}
+
+static uint64_t square(uint32_t p) {
+    return (uint64_t)p * p;
 }
 
 int main() {
@@ -175,34 +179,31 @@ int main() {
     /* Sieve the larger numbers, one 32-bit page at a time. */
     size_t in_range = 0;
     for (uint64_t page = 1; page <= UINT32_MAX; ++page) {
-        initialize_odd_bitmap(page << 32);
-        uint64_t min_index = (page << 31);
-        uint64_t max_index = (page << 31) + UINT32_MAX/2;
-        while (in_range < PRIME_COUNT_SMALL && next_multiple[in_range] < max_index) {
-            assert(next_multiple[in_range] >= min_index);
-            next_multiple[in_range] -= min_index;
-            ++in_range;
-        }
+        while ( in_range < PRIME_COUNT_SMALL &&
+                (square(small_primes[in_range]) >> 32) <= page ) ++in_range;
+
+        uint64_t start = (uint64_t) page << 32;
+        initialize_odd_bitmap(start);
 
         fprintf(stderr,
             "Sieving page %"PRIu64", from %"PRIu64" to %"PRIu64", using %zd primes.\n",
-            page, (page << 32) + 1, (page << 32) + UINT32_MAX, in_range);
+            page, start + 1, start + UINT32_MAX, in_range);
 
         /* This inner loop is doing most of the work. */
         for (size_t i = 0; i < in_range; ++i) {
-            uint64_t m = next_multiple[i];
-            uint64_t p = small_primes[i];
+            uint32_t m = next_multiple[i];
+            uint32_t p = small_primes[i];
             do {
                 odd_bitmap[m >> 3] &= ~(1 << (m & 7));
                 m += p;
             } while (m <= UINT32_MAX/2);
-            next_multiple[i] = m - (UINT32_MAX/2 + 1);
+            next_multiple[i] = m & (UINT32_MAX/2);
         }
 
         /* Output primes found on this page. */
         for (size_t j = 0; j <= UINT32_MAX/2; ++j) {
             if (odd_bitmap[j >> 3] & (1 << (j & 7))) {
-                output_prime((min_index + j)*2 + 1);
+                output_prime(start + 2*j + 1);
             }
         }
         flush();
