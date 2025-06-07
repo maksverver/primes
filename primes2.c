@@ -86,20 +86,26 @@ static void flush() {
 
 static void output_prime(uint64_t p) {
     assert(p != 0 && p >= out_last_val);
-    if (p <= out_next_max && out_last_len <= sizeof(out_buf) - out_pos) {
-        uint64_t add = p - out_last_val;
-        memcpy(&out_buf[out_pos], &out_buf[out_pos - out_last_len], out_last_len);
+    if (sizeof(out_buf) - out_pos < 24) {
+        flush();  /* ensure buffer space */
+    } else if (p <= out_next_max) {
+        /* copy previous line */
+        char tmp[24];
+        memcpy(tmp, &out_buf[out_pos - out_last_len], 24);
+        memcpy(&out_buf[out_pos], tmp, 24);
         out_pos += out_last_len;
-        for (char *p = (char*)&out_buf[out_pos - 2]; add > 0; --p) {
-            add += *p - '0';
-            *p = add%10 + '0';
+
+        /* add difference to last value */
+        uint64_t add = p - out_last_val;
+        out_last_val = p;
+        for (char *s = (char*)&out_buf[out_pos - 2]; add > 0; --s) {
+            add += *s - '0';
+            *s = add%10 + '0';
             add /= 10;
         }
-        out_last_val = p;
         return;
     }
 
-    if (out_pos >= sizeof(out_buf) - 100) flush();  /* ensure buffer space */
     out_last_val = p;
     out_last_len = snprintf(
             (char*)&out_buf[out_pos], sizeof(out_buf) - out_pos,
