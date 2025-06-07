@@ -20,9 +20,7 @@ TODO's:
 
     - maybe: option to output composites instead of primes?
 
-    - maybe:
-        - store wheel data in shared memory backed by shm_open()?
-        - mmap() prime wheel if possible?
+    - maybe: mmap() prime wheel if possible?
 
     - maybe: add a checksum to the wheel data to verify it is intact?
       this would be a bit tricky when loading partial data. (though I could
