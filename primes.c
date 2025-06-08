@@ -15,6 +15,10 @@ will print help on how to run.
 
 TODO's:
 
+    - maybe: backport some of the improvements from primes2.c here (e.g.
+      generating the 32-bit primes is much faster, integer printing is faster,
+      etc.) if I care about maintaining this tool long-term.
+
     - maybe: option to check primes using trial division? this should be faster
         than sieving when max - min or count is small.
 
